@@ -22,7 +22,8 @@ func main() {
 
 	// Configurar CORS
 	config := cors.DefaultConfig()
-	config.AllowOrigins = []string{"http://localhost:5173"} // Ajusta según tu frontend
+	config.AllowOrigins = []string{"https://frontcompiladores.duckdns.org"}
+// Ajusta según tu frontend
 	config.AllowMethods = []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"}
 	config.AllowHeaders = []string{"Origin", "Content-Type", "Accept", "Authorization"}
 	r.Use(cors.New(config))
