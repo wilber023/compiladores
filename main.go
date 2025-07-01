@@ -520,7 +520,7 @@ func main() {
 		api.GET("/database-info", GetDatabaseInfoHandler)
 	}
 	
-	// Ruta de health check
+
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"status": "ok",
