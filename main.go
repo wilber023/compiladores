@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
@@ -189,15 +190,39 @@ func InputValidationMiddleware() gin.HandlerFunc {
 	}
 }
 
-// Middleware de timeout
+// Middleware de timeout simplificado
 func TimeoutMiddleware(timeout time.Duration) gin.HandlerFunc {
-	return gin.TimeoutWithHandler(timeout, func(c *gin.Context) {
-		c.JSON(http.StatusRequestTimeout, APIResponse{
-			Success: false,
-			Message: "Request timeout",
-			Data:    nil,
-		})
-	})
+	return func(c *gin.Context) {
+		// Crear un contexto con timeout
+		ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
+		defer cancel()
+		
+		// Reemplazar el contexto de la request
+		c.Request = c.Request.WithContext(ctx)
+		
+		// Canal para verificar si el handler terminó
+		finished := make(chan bool, 1)
+		
+		go func() {
+			c.Next()
+			finished <- true
+		}()
+		
+		select {
+		case <-finished:
+			// Handler terminó normalmente
+			return
+		case <-ctx.Done():
+			// Timeout alcanzado
+			c.JSON(http.StatusRequestTimeout, APIResponse{
+				Success: false,
+				Message: "Request timeout",
+				Data:    nil,
+			})
+			c.Abort()
+			return
+		}
+	}
 }
 
 // Validación adicional para queries SQL
