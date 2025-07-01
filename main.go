@@ -35,7 +35,7 @@ var (
 	connMutex    = sync.Mutex{}
 )
 
-// Rate limiting middleware
+// Rate limiting middleware MÁS ESTRICTO
 func RateLimitMiddleware(requestsPerMinute int) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ip := c.ClientIP()
@@ -43,12 +43,14 @@ func RateLimitMiddleware(requestsPerMinute int) gin.HandlerFunc {
 		rateMutex.Lock()
 		limiter, exists := rateLimiters[ip]
 		if !exists {
-			limiter = rate.NewLimiter(rate.Limit(requestsPerMinute)/60, requestsPerMinute)
+			// Crear un limiter más estricto: requests/minuto dividido por 4 para hacer burst más pequeño
+			limiter = rate.NewLimiter(rate.Limit(requestsPerMinute)/60, max(1, requestsPerMinute/4))
 			rateLimiters[ip] = limiter
 		}
 		rateMutex.Unlock()
 		
 		if !limiter.Allow() {
+			log.Printf("🚫 Rate limit exceeded for IP: %s", ip)
 			c.JSON(http.StatusTooManyRequests, APIResponse{
 				Success: false,
 				Message: "Demasiadas solicitudes. Intenta más tarde.",
@@ -62,28 +64,54 @@ func RateLimitMiddleware(requestsPerMinute int) gin.HandlerFunc {
 	}
 }
 
-// Middleware para validar origen (Referer)
+// Helper function for max
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// Middleware para validar origen (Referer) MÁS ESTRICTO
 func TrustedOriginMiddleware(trustedOrigin string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Permitir requests directos (para testing)
 		referer := c.GetHeader("Referer")
 		origin := c.GetHeader("Origin")
-		
-		// Si viene de tu frontend específico, permitir
-		if strings.Contains(referer, trustedOrigin) || strings.Contains(origin, trustedOrigin) {
-			c.Next()
-			return
-		}
-		
-		// Si no tiene referer/origin, verificar User-Agent para detectar bots
 		userAgent := c.GetHeader("User-Agent")
+		
+		// Log para debugging
+		log.Printf("🔍 Request from IP: %s, Origin: %s, Referer: %s, UA: %s", 
+			c.ClientIP(), origin, referer, userAgent)
+		
+		// Verificar User-Agent malicioso PRIMERO
 		if userAgent == "" || 
 		   strings.Contains(strings.ToLower(userAgent), "bot") ||
 		   strings.Contains(strings.ToLower(userAgent), "crawler") ||
-		   strings.Contains(strings.ToLower(userAgent), "spider") {
+		   strings.Contains(strings.ToLower(userAgent), "spider") ||
+		   strings.Contains(strings.ToLower(userAgent), "curl") ||
+		   strings.Contains(strings.ToLower(userAgent), "wget") {
+			log.Printf("🤖 Blocked malicious User-Agent: %s", userAgent)
 			c.JSON(http.StatusForbidden, APIResponse{
 				Success: false,
-				Message: "Acceso no autorizado",
+				Message: "Acceso no autorizado - Bot detectado",
+				Data:    nil,
+			})
+			c.Abort()
+			return
+		}
+		
+		// Verificar origen/referer
+		validOrigin := false
+		if strings.Contains(referer, trustedOrigin) || strings.Contains(origin, trustedOrigin) {
+			validOrigin = true
+		}
+		
+		// Si no viene del origen confiable, rechazar
+		if !validOrigin {
+			log.Printf("🚫 Blocked invalid origin. Origin: %s, Referer: %s", origin, referer)
+			c.JSON(http.StatusForbidden, APIResponse{
+				Success: false,
+				Message: "Acceso no autorizado - Origen inválido",
 				Data:    nil,
 			})
 			c.Abort()
@@ -113,6 +141,7 @@ func IPWhitelistMiddleware(allowedIPs []string) gin.HandlerFunc {
 		}
 		
 		if !allowed {
+			log.Printf("🚫 IP not whitelisted: %s", clientIP)
 			c.JSON(http.StatusForbidden, APIResponse{
 				Success: false,
 				Message: "IP no autorizada",
@@ -126,14 +155,16 @@ func IPWhitelistMiddleware(allowedIPs []string) gin.HandlerFunc {
 	}
 }
 
-// Middleware para limitar conexiones concurrentes
+// Middleware para limitar conexiones concurrentes MÁS ESTRICTO
 func ConcurrentConnectionsMiddleware(maxConns int) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ip := c.ClientIP()
 		
 		connMutex.Lock()
-		if activeConns[ip] >= maxConns {
+		currentConns := activeConns[ip]
+		if currentConns >= maxConns {
 			connMutex.Unlock()
+			log.Printf("🔗 Too many concurrent connections from IP: %s (%d/%d)", ip, currentConns, maxConns)
 			c.JSON(http.StatusTooManyRequests, APIResponse{
 				Success: false,
 				Message: "Demasiadas conexiones concurrentes",
@@ -214,6 +245,7 @@ func TimeoutMiddleware(timeout time.Duration) gin.HandlerFunc {
 			return
 		case <-ctx.Done():
 			// Timeout alcanzado
+			log.Printf("⏱️ Request timeout for IP: %s", c.ClientIP())
 			c.JSON(http.StatusRequestTimeout, APIResponse{
 				Success: false,
 				Message: "Request timeout",
@@ -225,14 +257,15 @@ func TimeoutMiddleware(timeout time.Duration) gin.HandlerFunc {
 	}
 }
 
-// Validación adicional para queries SQL
+// Validación adicional para queries SQL MÁS ESTRICTA
 func validateSQLQuery(query string) error {
 	// Limpiar la query
+	originalQuery := query
 	query = strings.TrimSpace(strings.ToUpper(query))
 	
 	// Longitud máxima
-	if len(query) > 2000 {
-		return fmt.Errorf("query demasiado larga")
+	if len(query) > 1000 {  // Más estricto: 1000 caracteres
+		return fmt.Errorf("query demasiado larga (%d caracteres, máximo 1000)", len(originalQuery))
 	}
 	
 	// Prevenir múltiples statements
@@ -240,21 +273,16 @@ func validateSQLQuery(query string) error {
 		return fmt.Errorf("múltiples statements no permitidos")
 	}
 	
-	// Palabras prohibidas
+	// Palabras prohibidas MÁS EXTENSAS
 	dangerous := []string{
-		"DROP DATABASE",
-		"DROP SCHEMA", 
-		"TRUNCATE",
-		"SHUTDOWN",
-		"PRAGMA",
-		"ATTACH",
-		"DETACH",
-		"VACUUM",
-		"REINDEX",
+		"DROP", "DELETE", "TRUNCATE", "SHUTDOWN", "PRAGMA", "ATTACH", "DETACH",
+		"VACUUM", "REINDEX", "EXEC", "EXECUTE", "UNION", "SCRIPT", "--", "/*",
+		"XP_", "SP_", "INFORMATION_SCHEMA", "SYSOBJECTS", "SYSCOLUMNS",
 	}
 	
 	for _, word := range dangerous {
 		if strings.Contains(query, word) {
+			log.Printf("🛡️ SQL injection attempt blocked: %s", word)
 			return fmt.Errorf("comando no permitido: %s", word)
 		}
 	}
@@ -264,8 +292,8 @@ func validateSQLQuery(query string) error {
 
 // Validar nombre de base de datos
 func validateDatabaseName(name string) error {
-	if len(name) == 0 || len(name) > 50 {
-		return fmt.Errorf("nombre de base de datos debe tener entre 1 y 50 caracteres")
+	if len(name) == 0 || len(name) > 30 {  // Más estricto: 30 caracteres
+		return fmt.Errorf("nombre de base de datos debe tener entre 1 y 30 caracteres")
 	}
 	
 	// Validar caracteres permitidos
@@ -454,21 +482,22 @@ func getEnvArrayOrDefault(key string, defaultValue []string) []string {
 }
 
 func main() {
-	// Configuración de seguridad sin API Key
+	// Configuración de seguridad MÁS ESTRICTA
 	config := SecurityConfig{
-		MaxRequestsPerMin:   getEnvIntOrDefault("MAX_REQUESTS_PER_MIN", 60),  // Más permisivo
-		MaxConcurrentConns:  getEnvIntOrDefault("MAX_CONCURRENT_CONNS", 10),  // Más permisivo
+		MaxRequestsPerMin:   getEnvIntOrDefault("MAX_REQUESTS_PER_MIN", 30),   // Más estricto: 30/min
+		MaxConcurrentConns:  getEnvIntOrDefault("MAX_CONCURRENT_CONNS", 3),    // Más estricto: 3 conexiones
 		EnableIPWhitelist:   getEnvBoolOrDefault("ENABLE_IP_WHITELIST", false),
 		AllowedIPs:          getEnvArrayOrDefault("ALLOWED_IPS", []string{}),
-		RequestTimeout:      time.Duration(getEnvIntOrDefault("REQUEST_TIMEOUT_SECONDS", 30)) * time.Second,
-		MaxQueryLength:      getEnvIntOrDefault("MAX_QUERY_LENGTH", 2000),
+		RequestTimeout:      time.Duration(getEnvIntOrDefault("REQUEST_TIMEOUT_SECONDS", 15)) * time.Second, // Más rápido
+		MaxQueryLength:      getEnvIntOrDefault("MAX_QUERY_LENGTH", 1000),     // Más corto
 		TrustedOrigin:       getEnvOrDefault("TRUSTED_ORIGIN", "frontcompiladores.duckdns.org"),
 	}
 	
-	log.Printf("🛡️  Protección backend activada")
+	log.Printf("🛡️  Protección backend ESTRICTA activada")
 	log.Printf("⚡ Rate limit: %d requests/min", config.MaxRequestsPerMin)
 	log.Printf("🔗 Conexiones concurrentes max: %d", config.MaxConcurrentConns)
 	log.Printf("🌐 Origen confiable: %s", config.TrustedOrigin)
+	log.Printf("⏱️ Timeout: %v", config.RequestTimeout)
 	
 	// Inicializar la base de datos
 	err := InitDB()
@@ -477,16 +506,16 @@ func main() {
 	}
 	defer CloseDB()
 	
-	// Configurar Gin
+	// Configurar Gin en modo release
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
 	
-	// Middleware de seguridad global
+	// Middleware de seguridad global MÁS ESTRICTO
 	r.Use(TimeoutMiddleware(config.RequestTimeout))
 	r.Use(InputValidationMiddleware())
 	r.Use(RateLimitMiddleware(config.MaxRequestsPerMin))
 	r.Use(ConcurrentConnectionsMiddleware(config.MaxConcurrentConns))
-	r.Use(TrustedOriginMiddleware(config.TrustedOrigin))
+	r.Use(TrustedOriginMiddleware(config.TrustedOrigin))  // ESTE es clave para bloquear orígenes
 	
 	if config.EnableIPWhitelist {
 		r.Use(IPWhitelistMiddleware(config.AllowedIPs))
@@ -520,7 +549,7 @@ func main() {
 		api.GET("/database-info", GetDatabaseInfoHandler)
 	}
 	
-
+	// Health check SIN protecciones para permitir monitoreo
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"status": "ok",
@@ -535,7 +564,7 @@ func main() {
 		port = "8080"
 	}
 	
-	log.Printf("🚀 Servidor seguro iniciado en puerto %s", port)
+	log.Printf("🚀 Servidor ULTRA-SEGURO iniciado en puerto %s", port)
 	log.Printf("🌐 CORS configurado para: https://frontcompiladores.duckdns.org")
 	log.Printf("💡 Health check disponible en: /health")
 	log.Fatal(http.ListenAndServe(":"+port, r))
