@@ -16,8 +16,7 @@ func DetailedLoggingMiddleware() gin.HandlerFunc {
 		start := time.Now()
 		
 		// Log request
-		log.Printf("📥 [%s] %s %s - Headers: %v", 
-			c.ClientIP(), c.Request.Method, c.Request.URL.Path, c.Request.Header)
+		log.Printf("📥 [%s] %s %s", c.ClientIP(), c.Request.Method, c.Request.URL.Path)
 		
 		c.Next()
 		
@@ -27,8 +26,8 @@ func DetailedLoggingMiddleware() gin.HandlerFunc {
 	}
 }
 
-// Handler con logs detallados para use-database
-func UseDatabaseHandlerWithLogs(c *gin.Context) {
+// UseDatabaseHandler con manejo de errores
+func UseDatabaseHandlerSafe(c *gin.Context) {
 	log.Printf("🔍 UseDatabaseHandler called")
 	
 	var req DatabaseRequest
@@ -54,16 +53,30 @@ func UseDatabaseHandlerWithLogs(c *gin.Context) {
 		return
 	}
 	
-	log.Printf("🔄 Calling original UseDatabaseHandler")
+	// Intentar usar la base de datos con manejo de errores
+	log.Printf("🔄 Attempting to use database: %s", req.Database)
 	
-	// Llamar al handler original
-	UseDatabaseHandler(c)
+	err := UseDatabase(req.Database)
+	if err != nil {
+		log.Printf("❌ UseDatabase failed: %v", err)
+		c.JSON(http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Message: err.Error(),
+			Data:    nil,
+		})
+		return
+	}
 	
-	log.Printf("✅ UseDatabaseHandler completed")
+	log.Printf("✅ Database switch successful")
+	c.JSON(http.StatusOK, APIResponse{
+		Success: true,
+		Message: "Usando base de datos: " + req.Database,
+		Data:    nil,
+	})
 }
 
-// Handler con logs para create-table
-func CreateTableHandlerWithLogs(c *gin.Context) {
+// CreateTableHandler con manejo de errores
+func CreateTableHandlerSafe(c *gin.Context) {
 	log.Printf("🔍 CreateTableHandler called")
 	
 	var req QueryRequest
@@ -77,7 +90,7 @@ func CreateTableHandlerWithLogs(c *gin.Context) {
 		return
 	}
 	
-	log.Printf("✅ Request parsed: %+v", req)
+	log.Printf("✅ Request parsed, query: %s", req.Query)
 	
 	if req.Query == "" {
 		log.Printf("❌ Query is empty")
@@ -89,28 +102,30 @@ func CreateTableHandlerWithLogs(c *gin.Context) {
 		return
 	}
 	
-	log.Printf("🔄 Calling original CreateTableHandler")
+	// Ejecutar query con manejo de errores
+	log.Printf("🔄 Attempting to execute query")
 	
-	// Llamar al handler original
-	CreateTableHandler(c)
+	err := ExecuteQuery(req.Query)
+	if err != nil {
+		log.Printf("❌ ExecuteQuery failed: %v", err)
+		c.JSON(http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Message: err.Error(),
+			Data:    nil,
+		})
+		return
+	}
 	
-	log.Printf("✅ CreateTableHandler completed")
+	log.Printf("✅ Query executed successfully")
+	c.JSON(http.StatusOK, APIResponse{
+		Success: true,
+		Message: "Tabla creada exitosamente",
+		Data:    nil,
+	})
 }
 
-// Handler con logs para database-info
-func GetDatabaseInfoHandlerWithLogs(c *gin.Context) {
-	log.Printf("🔍 GetDatabaseInfoHandler called")
-	
-	log.Printf("🔄 Calling original GetDatabaseInfoHandler")
-	
-	// Llamar al handler original
-	GetDatabaseInfoHandler(c)
-	
-	log.Printf("✅ GetDatabaseInfoHandler completed")
-}
-
-// Handler con logs para insert-data
-func InsertDataHandlerWithLogs(c *gin.Context) {
+// InsertDataHandler con manejo de errores
+func InsertDataHandlerSafe(c *gin.Context) {
 	log.Printf("🔍 InsertDataHandler called")
 	
 	var req QueryRequest
@@ -124,21 +139,176 @@ func InsertDataHandlerWithLogs(c *gin.Context) {
 		return
 	}
 	
+	log.Printf("✅ Request parsed, query: %s", req.Query)
+	
+	if req.Query == "" {
+		log.Printf("❌ Query is empty")
+		c.JSON(http.StatusBadRequest, APIResponse{
+			Success: false,
+			Message: "Query requerida",
+			Data:    nil,
+		})
+		return
+	}
+	
+	// Ejecutar query con manejo de errores
+	log.Printf("🔄 Attempting to execute insert query")
+	
+	err := ExecuteQuery(req.Query)
+	if err != nil {
+		log.Printf("❌ ExecuteQuery failed: %v", err)
+		c.JSON(http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Message: err.Error(),
+			Data:    nil,
+		})
+		return
+	}
+	
+	log.Printf("✅ Insert query executed successfully")
+	c.JSON(http.StatusOK, APIResponse{
+		Success: true,
+		Message: "Datos insertados exitosamente",
+		Data:    nil,
+	})
+}
+
+// GetDatabaseInfoHandler con manejo de errores
+func GetDatabaseInfoHandlerSafe(c *gin.Context) {
+	log.Printf("🔍 GetDatabaseInfoHandler called")
+	
+	info, err := GetDatabaseInfo()
+	if err != nil {
+		log.Printf("❌ GetDatabaseInfo failed: %v", err)
+		c.JSON(http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Message: err.Error(),
+			Data:    nil,
+		})
+		return
+	}
+	
+	log.Printf("✅ Database info retrieved successfully")
+	c.JSON(http.StatusOK, APIResponse{
+		Success: true,
+		Message: "Información de base de datos obtenida exitosamente",
+		Data:    info,
+	})
+}
+
+// ModifyDataHandler con manejo de errores
+func ModifyDataHandlerSafe(c *gin.Context) {
+	log.Printf("🔍 ModifyDataHandler called")
+	
+	var req QueryRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("❌ Error binding JSON: %v", err)
+		c.JSON(http.StatusBadRequest, APIResponse{
+			Success: false,
+			Message: "Error al parsear JSON: " + err.Error(),
+			Data:    nil,
+		})
+		return
+	}
+	
+	log.Printf("✅ Request parsed, query: %s", req.Query)
+	
+	err := ExecuteQuery(req.Query)
+	if err != nil {
+		log.Printf("❌ ExecuteQuery failed: %v", err)
+		c.JSON(http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Message: err.Error(),
+			Data:    nil,
+		})
+		return
+	}
+	
+	log.Printf("✅ Modify query executed successfully")
+	c.JSON(http.StatusOK, APIResponse{
+		Success: true,
+		Message: "Datos modificados exitosamente",
+		Data:    nil,
+	})
+}
+
+// CreateDatabaseHandler con manejo de errores
+func CreateDatabaseHandlerSafe(c *gin.Context) {
+	log.Printf("🔍 CreateDatabaseHandler called")
+	
+	var req DatabaseRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("❌ Error binding JSON: %v", err)
+		c.JSON(http.StatusBadRequest, APIResponse{
+			Success: false,
+			Message: "Error al parsear JSON: " + err.Error(),
+			Data:    nil,
+		})
+		return
+	}
+	
 	log.Printf("✅ Request parsed: %+v", req)
 	
-	log.Printf("🔄 Calling original InsertDataHandler")
+	err := CreateDatabase(req.Database)
+	if err != nil {
+		log.Printf("❌ CreateDatabase failed: %v", err)
+		c.JSON(http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Message: err.Error(),
+			Data:    nil,
+		})
+		return
+	}
 	
-	// Llamar al handler original
-	InsertDataHandler(c)
+	log.Printf("✅ Database created successfully: %s", req.Database)
+	c.JSON(http.StatusOK, APIResponse{
+		Success: true,
+		Message: "Base de datos creada exitosamente: " + req.Database,
+		Data:    nil,
+	})
+}
+
+// DeleteDatabaseHandler con manejo de errores
+func DeleteDatabaseHandlerSafe(c *gin.Context) {
+	log.Printf("🔍 DeleteDatabaseHandler called")
 	
-	log.Printf("✅ InsertDataHandler completed")
+	var req DatabaseRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("❌ Error binding JSON: %v", err)
+		c.JSON(http.StatusBadRequest, APIResponse{
+			Success: false,
+			Message: "Error al parsear JSON: " + err.Error(),
+			Data:    nil,
+		})
+		return
+	}
+	
+	log.Printf("✅ Request parsed: %+v", req)
+	
+	err := DeleteDatabase(req.Database)
+	if err != nil {
+		log.Printf("❌ DeleteDatabase failed: %v", err)
+		c.JSON(http.StatusInternalServerError, APIResponse{
+			Success: false,
+			Message: err.Error(),
+			Data:    nil,
+		})
+		return
+	}
+	
+	log.Printf("✅ Database deleted successfully: %s", req.Database)
+	c.JSON(http.StatusOK, APIResponse{
+		Success: true,
+		Message: "Base de datos eliminada exitosamente: " + req.Database,
+		Data:    nil,
+	})
 }
 
 func main() {
 	// Configurar logging detallado
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	
-	log.Printf("🚀 Starting server with detailed debugging...")
+	log.Printf("🚀 Starting server with error handling...")
 	
 	// Inicializar la base de datos
 	log.Printf("🔄 Initializing database...")
@@ -149,65 +319,45 @@ func main() {
 	defer CloseDB()
 	log.Printf("✅ Database initialized")
 
-	// Configurar Gin en modo debug para ver más detalles
-	gin.SetMode(gin.DebugMode)
+	// Configurar Gin en modo release
+	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
 
-	// Middleware de logging detallado
+	// Middleware de logging
 	r.Use(DetailedLoggingMiddleware())
 
-	// CORS súper permisivo
-	log.Printf("🌐 Setting up CORS...")
+	// CORS permisivo
 	corsConfig := cors.DefaultConfig()
-	corsConfig.AllowAllOrigins = true // Permitir TODOS los orígenes
+	corsConfig.AllowAllOrigins = true
 	corsConfig.AllowMethods = []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"}
 	corsConfig.AllowHeaders = []string{"*"}
 	corsConfig.ExposeHeaders = []string{"*"}
 	corsConfig.AllowCredentials = false
 	r.Use(cors.New(corsConfig))
-	log.Printf("✅ CORS configured (allow all origins)")
 
-	// Rutas de la API con handlers con logs
-	log.Printf("🔄 Setting up API routes...")
+	// Rutas de la API con handlers SEGUROS
 	api := r.Group("/api")
 	{
-		// Análisis sin modificar
-		api.POST("/lexical-analysis", func(c *gin.Context) {
-			log.Printf("🔍 LexicalAnalysisHandler called")
-			LexicalAnalysisHandler(c)
-		})
-		api.POST("/syntactic-analysis", func(c *gin.Context) {
-			log.Printf("🔍 SyntacticAnalysisHandler called")
-			SyntacticAnalysisHandler(c)
-		})
+		// Análisis sin modificar (estos funcionan)
+		api.POST("/lexical-analysis", LexicalAnalysisHandler)
+		api.POST("/syntactic-analysis", SyntacticAnalysisHandler)
 		
-		// Operaciones de BD con logs detallados
-		api.POST("/create-database", func(c *gin.Context) {
-			log.Printf("🔍 CreateDatabaseHandler called")
-			CreateDatabaseHandler(c)
-		})
-		api.POST("/use-database", UseDatabaseHandlerWithLogs)
-		api.POST("/create-table", CreateTableHandlerWithLogs)
-		api.POST("/insert-data", InsertDataHandlerWithLogs)
-		api.POST("/modify-data", func(c *gin.Context) {
-			log.Printf("🔍 ModifyDataHandler called")
-			ModifyDataHandler(c)
-		})
-		api.POST("/delete-database", func(c *gin.Context) {
-			log.Printf("🔍 DeleteDatabaseHandler called")
-			DeleteDatabaseHandler(c)
-		})
-		api.GET("/database-info", GetDatabaseInfoHandlerWithLogs)
+		// Operaciones de BD con manejo de errores COMPLETO
+		api.POST("/create-database", CreateDatabaseHandlerSafe)
+		api.POST("/use-database", UseDatabaseHandlerSafe)
+		api.POST("/create-table", CreateTableHandlerSafe)
+		api.POST("/insert-data", InsertDataHandlerSafe)
+		api.POST("/modify-data", ModifyDataHandlerSafe)
+		api.POST("/delete-database", DeleteDatabaseHandlerSafe)
+		api.GET("/database-info", GetDatabaseInfoHandlerSafe)
 	}
-	log.Printf("✅ API routes configured")
 
-	// Health check con logs
+	// Health check
 	r.GET("/health", func(c *gin.Context) {
-		log.Printf("🔍 Health check called")
 		c.JSON(http.StatusOK, gin.H{
 			"status": "ok",
 			"time":   time.Now().Format(time.RFC3339),
-			"debug":  true,
+			"fixed":  true,
 		})
 	})
 
@@ -217,9 +367,8 @@ func main() {
 		port = "8080"
 	}
 
-	log.Printf("🚀 Starting server on port %s with DEBUG MODE", port)
-	log.Printf("🌐 CORS: Allow all origins")
-	log.Printf("📋 All requests will be logged in detail")
+	log.Printf("🚀 Server with ERROR HANDLING started on port %s", port)
+	log.Printf("🔧 All handlers now have proper error handling")
 	log.Printf("💡 Health check: /health")
 	
 	log.Fatal(http.ListenAndServe(":"+port, r))
