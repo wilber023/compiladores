@@ -1,53 +1,54 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"golang.org/x/time/rate"
 )
 
-// Rate limiting simple y permisivo
+// Configuración de seguridad backend-only
+type SecurityConfig struct {
+	MaxRequestsPerMin   int
+	MaxConcurrentConns  int
+	EnableIPWhitelist   bool
+	AllowedIPs          []string
+	RequestTimeout      time.Duration
+	MaxQueryLength      int
+	TrustedOrigin       string
+}
+
+// Rate limiter por IP
 var (
-	requestCounts = make(map[string][]time.Time)
-	requestMutex  = sync.Mutex{}
+	rateLimiters = make(map[string]*rate.Limiter)
+	rateMutex    = sync.Mutex{}
+	activeConns  = make(map[string]int)
+	connMutex    = sync.Mutex{}
 )
 
-// Rate limiting MUY permisivo (solo para prevenir ataques masivos)
-func SimpleRateLimitMiddleware(requestsPerMinute int) gin.HandlerFunc {
+// Rate limiting middleware
+func RateLimitMiddleware(requestsPerMinute int) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ip := c.ClientIP()
-		now := time.Now()
 		
-		requestMutex.Lock()
-		
-		// Limpiar requests antiguos (más de 1 minuto)
-		if requests, exists := requestCounts[ip]; exists {
-			var validRequests []time.Time
-			for _, reqTime := range requests {
-				if now.Sub(reqTime) < time.Minute {
-					validRequests = append(validRequests, reqTime)
-				}
-			}
-			requestCounts[ip] = validRequests
+		rateMutex.Lock()
+		limiter, exists := rateLimiters[ip]
+		if !exists {
+			limiter = rate.NewLimiter(rate.Limit(requestsPerMinute)/60, requestsPerMinute)
+			rateLimiters[ip] = limiter
 		}
+		rateMutex.Unlock()
 		
-		// Solo bloquear si hay MUCHAS requests (abuso extremo)
-		if len(requestCounts[ip]) >= requestsPerMinute {
-			requestMutex.Unlock()
-			log.Printf("🚫 Extreme rate limit exceeded for IP: %s", ip)
-			
-			// IMPORTANTE: Asegurar CORS headers en respuesta de error
-			c.Header("Access-Control-Allow-Origin", "https://frontcompiladores.duckdns.org")
-			c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			c.Header("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization")
-			
+		if !limiter.Allow() {
 			c.JSON(http.StatusTooManyRequests, APIResponse{
 				Success: false,
 				Message: "Demasiadas solicitudes. Intenta más tarde.",
@@ -57,68 +58,116 @@ func SimpleRateLimitMiddleware(requestsPerMinute int) gin.HandlerFunc {
 			return
 		}
 		
-		// Agregar request actual
-		requestCounts[ip] = append(requestCounts[ip], now)
-		requestMutex.Unlock()
-		
 		c.Next()
 	}
 }
 
-// Middleware SOLO para bloquear bots obvios (muy permisivo)
-func BasicBotProtectionMiddleware() gin.HandlerFunc {
+// Middleware para validar origen (Referer)
+func TrustedOriginMiddleware(trustedOrigin string) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		userAgent := c.GetHeader("User-Agent")
-		path := c.Request.URL.Path
+		// Permitir requests directos (para testing)
+		referer := c.GetHeader("Referer")
+		origin := c.GetHeader("Origin")
 		
-		// NO aplicar a health check
-		if path == "/health" {
+		// Si viene de tu frontend específico, permitir
+		if strings.Contains(referer, trustedOrigin) || strings.Contains(origin, trustedOrigin) {
 			c.Next()
 			return
 		}
 		
-		// Solo bloquear bots MUY obvios
-		if userAgent != "" {
-			lowerUA := strings.ToLower(userAgent)
-			if strings.Contains(lowerUA, "googlebot") ||
-			   strings.Contains(lowerUA, "bingbot") ||
-			   strings.Contains(lowerUA, "slurp") ||
-			   (strings.Contains(lowerUA, "curl") && !strings.Contains(lowerUA, "mozilla")) ||
-			   strings.Contains(lowerUA, "wget") ||
-			   strings.Contains(lowerUA, "scanner") ||
-			   strings.Contains(lowerUA, "attack") {
-				log.Printf("🤖 Blocked obvious bot: %s", userAgent)
-				
-				// CORS headers en respuesta de error
-				c.Header("Access-Control-Allow-Origin", "https://frontcompiladores.duckdns.org")
-				c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-				c.Header("Access-Control-Allow-Headers", "Origin, Content-Type, Accept, Authorization")
-				
-				c.JSON(http.StatusForbidden, APIResponse{
-					Success: false,
-					Message: "Acceso no autorizado",
-					Data:    nil,
-				})
-				c.Abort()
-				return
-			}
+		// Si no tiene referer/origin, verificar User-Agent para detectar bots
+		userAgent := c.GetHeader("User-Agent")
+		if userAgent == "" || 
+		   strings.Contains(strings.ToLower(userAgent), "bot") ||
+		   strings.Contains(strings.ToLower(userAgent), "crawler") ||
+		   strings.Contains(strings.ToLower(userAgent), "spider") {
+			c.JSON(http.StatusForbidden, APIResponse{
+				Success: false,
+				Message: "Acceso no autorizado",
+				Data:    nil,
+			})
+			c.Abort()
+			return
 		}
 		
 		c.Next()
 	}
 }
 
-// Middleware de validación de entrada MÁS permisivo
+// Middleware de whitelist de IPs
+func IPWhitelistMiddleware(allowedIPs []string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if len(allowedIPs) == 0 {
+			c.Next()
+			return
+		}
+		
+		clientIP := c.ClientIP()
+		allowed := false
+		
+		for _, ip := range allowedIPs {
+			if clientIP == ip || strings.HasPrefix(clientIP, ip) {
+				allowed = true
+				break
+			}
+		}
+		
+		if !allowed {
+			c.JSON(http.StatusForbidden, APIResponse{
+				Success: false,
+				Message: "IP no autorizada",
+				Data:    nil,
+			})
+			c.Abort()
+			return
+		}
+		
+		c.Next()
+	}
+}
+
+// Middleware para limitar conexiones concurrentes
+func ConcurrentConnectionsMiddleware(maxConns int) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ip := c.ClientIP()
+		
+		connMutex.Lock()
+		if activeConns[ip] >= maxConns {
+			connMutex.Unlock()
+			c.JSON(http.StatusTooManyRequests, APIResponse{
+				Success: false,
+				Message: "Demasiadas conexiones concurrentes",
+				Data:    nil,
+			})
+			c.Abort()
+			return
+		}
+		activeConns[ip]++
+		connMutex.Unlock()
+		
+		defer func() {
+			connMutex.Lock()
+			activeConns[ip]--
+			if activeConns[ip] <= 0 {
+				delete(activeConns, ip)
+			}
+			connMutex.Unlock()
+		}()
+		
+		c.Next()
+	}
+}
+
+// Middleware de validación de entrada
 func InputValidationMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		// Validar Content-Type SOLO para requests POST y con contenido
-		if c.Request.Method == "POST" && c.Request.ContentLength > 0 {
+		// Validar Content-Type para requests POST
+		if c.Request.Method == "POST" {
 			contentType := c.GetHeader("Content-Type")
-			if !strings.Contains(contentType, "application/json") && 
-			   !strings.Contains(contentType, "text/plain") {
+			if !strings.Contains(contentType, "application/json") {
 				c.JSON(http.StatusBadRequest, APIResponse{
 					Success: false,
-					Message: "Content-Type inválido",
+					Message: "Content-Type debe ser application/json",
 					Data:    nil,
 				})
 				c.Abort()
@@ -126,8 +175,8 @@ func InputValidationMiddleware() gin.HandlerFunc {
 			}
 		}
 		
-		// Validar tamaño del request (muy permisivo)
-		if c.Request.ContentLength > 10*1024*1024 { // 10MB max
+		// Validar tamaño del request
+		if c.Request.ContentLength > 1024*1024 { // 1MB max
 			c.JSON(http.StatusRequestEntityTooLarge, APIResponse{
 				Success: false,
 				Message: "Request demasiado grande",
@@ -141,60 +190,108 @@ func InputValidationMiddleware() gin.HandlerFunc {
 	}
 }
 
-// Validación SQL MÁS permisiva (solo bloquear lo más peligroso)
-func validateSQLQuery(query string) error {
-	if len(query) == 0 {
-		return fmt.Errorf("query vacía")
+// Middleware de timeout simplificado
+func TimeoutMiddleware(timeout time.Duration) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		// Crear un contexto con timeout
+		ctx, cancel := context.WithTimeout(c.Request.Context(), timeout)
+		defer cancel()
+		
+		// Reemplazar el contexto de la request
+		c.Request = c.Request.WithContext(ctx)
+		
+		// Canal para verificar si el handler terminó
+		finished := make(chan bool, 1)
+		
+		go func() {
+			c.Next()
+			finished <- true
+		}()
+		
+		select {
+		case <-finished:
+			// Handler terminó normalmente
+			return
+		case <-ctx.Done():
+			// Timeout alcanzado
+			c.JSON(http.StatusRequestTimeout, APIResponse{
+				Success: false,
+				Message: "Request timeout",
+				Data:    nil,
+			})
+			c.Abort()
+			return
+		}
 	}
+}
+
+// Validación adicional para queries SQL
+func validateSQLQuery(query string) error {
+	// Limpiar la query
+	query = strings.TrimSpace(strings.ToUpper(query))
 	
-	// Longitud máxima muy permisiva
-	if len(query) > 5000 {
+	// Longitud máxima
+	if len(query) > 2000 {
 		return fmt.Errorf("query demasiado larga")
 	}
 	
-	// Solo bloquear comandos EXTREMADAMENTE peligrosos
-	query = strings.ToUpper(query)
+	// Prevenir múltiples statements
+	if strings.Contains(query, ";") && !strings.HasSuffix(query, ";") {
+		return fmt.Errorf("múltiples statements no permitidos")
+	}
+	
+	// Palabras prohibidas
 	dangerous := []string{
 		"DROP DATABASE",
 		"DROP SCHEMA", 
+		"TRUNCATE",
 		"SHUTDOWN",
-		"EXEC XP_",
-		"EXEC SP_",
+		"PRAGMA",
+		"ATTACH",
+		"DETACH",
+		"VACUUM",
+		"REINDEX",
 	}
 	
 	for _, word := range dangerous {
 		if strings.Contains(query, word) {
-			log.Printf("🛡️ Blocked dangerous SQL: %s", word)
-			return fmt.Errorf("comando no permitido")
+			return fmt.Errorf("comando no permitido: %s", word)
 		}
 	}
 	
 	return nil
 }
 
-// Validar nombre de BD más permisivo
+// Validar nombre de base de datos
 func validateDatabaseName(name string) error {
-	if len(name) == 0 {
-		return fmt.Errorf("nombre de base de datos requerido")
+	if len(name) == 0 || len(name) > 50 {
+		return fmt.Errorf("nombre de base de datos debe tener entre 1 y 50 caracteres")
 	}
-	if len(name) > 100 {
-		return fmt.Errorf("nombre demasiado largo")
+	
+	// Validar caracteres permitidos
+	for _, char := range name {
+		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || 
+			 (char >= '0' && char <= '9') || char == '_') {
+			return fmt.Errorf("nombre contiene caracteres no permitidos")
+		}
 	}
+	
 	return nil
 }
 
-// Handlers con validación mínima
+// Handlers seguros que envuelven los originales
 func CreateDatabaseHandlerSecure(c *gin.Context) {
 	var req DatabaseRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, APIResponse{
 			Success: false,
-			Message: "Datos de entrada inválidos: " + err.Error(),
+			Message: "Datos de entrada inválidos",
 			Data:    nil,
 		})
 		return
 	}
 	
+	// Validar nombre de BD
 	if err := validateDatabaseName(req.Database); err != nil {
 		c.JSON(http.StatusBadRequest, APIResponse{
 			Success: false,
@@ -204,6 +301,7 @@ func CreateDatabaseHandlerSecure(c *gin.Context) {
 		return
 	}
 	
+	// Llamar al handler original
 	CreateDatabaseHandler(c)
 }
 
@@ -212,7 +310,7 @@ func UseDatabaseHandlerSecure(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, APIResponse{
 			Success: false,
-			Message: "Datos de entrada inválidos: " + err.Error(),
+			Message: "Datos de entrada inválidos",
 			Data:    nil,
 		})
 		return
@@ -235,7 +333,7 @@ func CreateTableHandlerSecure(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, APIResponse{
 			Success: false,
-			Message: "Datos de entrada inválidos: " + err.Error(),
+			Message: "Datos de entrada inválidos",
 			Data:    nil,
 		})
 		return
@@ -244,7 +342,7 @@ func CreateTableHandlerSecure(c *gin.Context) {
 	if err := validateSQLQuery(req.Query); err != nil {
 		c.JSON(http.StatusBadRequest, APIResponse{
 			Success: false,
-			Message: err.Error(),
+			Message: fmt.Sprintf("Query inválida: %s", err.Error()),
 			Data:    nil,
 		})
 		return
@@ -258,7 +356,7 @@ func InsertDataHandlerSecure(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, APIResponse{
 			Success: false,
-			Message: "Datos de entrada inválidos: " + err.Error(),
+			Message: "Datos de entrada inválidos",
 			Data:    nil,
 		})
 		return
@@ -267,7 +365,7 @@ func InsertDataHandlerSecure(c *gin.Context) {
 	if err := validateSQLQuery(req.Query); err != nil {
 		c.JSON(http.StatusBadRequest, APIResponse{
 			Success: false,
-			Message: err.Error(),
+			Message: fmt.Sprintf("Query inválida: %s", err.Error()),
 			Data:    nil,
 		})
 		return
@@ -281,7 +379,7 @@ func ModifyDataHandlerSecure(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, APIResponse{
 			Success: false,
-			Message: "Datos de entrada inválidos: " + err.Error(),
+			Message: "Datos de entrada inválidos",
 			Data:    nil,
 		})
 		return
@@ -290,7 +388,7 @@ func ModifyDataHandlerSecure(c *gin.Context) {
 	if err := validateSQLQuery(req.Query); err != nil {
 		c.JSON(http.StatusBadRequest, APIResponse{
 			Success: false,
-			Message: err.Error(),
+			Message: fmt.Sprintf("Query inválida: %s", err.Error()),
 			Data:    nil,
 		})
 		return
@@ -304,7 +402,7 @@ func DeleteDatabaseHandlerSecure(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, APIResponse{
 			Success: false,
-			Message: "Datos de entrada inválidos: " + err.Error(),
+			Message: "Datos de entrada inválidos",
 			Data:    nil,
 		})
 		return
@@ -322,41 +420,97 @@ func DeleteDatabaseHandlerSecure(c *gin.Context) {
 	DeleteDatabaseHandler(c)
 }
 
+// Funciones auxiliares
+func getEnvOrDefault(key, defaultValue string) string {
+	if value := os.Getenv(key); value != "" {
+		return value
+	}
+	return defaultValue
+}
+
+func getEnvIntOrDefault(key string, defaultValue int) int {
+	if value := os.Getenv(key); value != "" {
+		if intValue, err := strconv.Atoi(value); err == nil {
+			return intValue
+		}
+	}
+	return defaultValue
+}
+
+func getEnvBoolOrDefault(key string, defaultValue bool) bool {
+	if value := os.Getenv(key); value != "" {
+		if boolValue, err := strconv.ParseBool(value); err == nil {
+			return boolValue
+		}
+	}
+	return defaultValue
+}
+
+func getEnvArrayOrDefault(key string, defaultValue []string) []string {
+	if value := os.Getenv(key); value != "" {
+		return strings.Split(value, ",")
+	}
+	return defaultValue
+}
+
 func main() {
+	// Configuración de seguridad sin API Key
+	config := SecurityConfig{
+		MaxRequestsPerMin:   getEnvIntOrDefault("MAX_REQUESTS_PER_MIN", 60),  // Más permisivo
+		MaxConcurrentConns:  getEnvIntOrDefault("MAX_CONCURRENT_CONNS", 10),  // Más permisivo
+		EnableIPWhitelist:   getEnvBoolOrDefault("ENABLE_IP_WHITELIST", false),
+		AllowedIPs:          getEnvArrayOrDefault("ALLOWED_IPS", []string{}),
+		RequestTimeout:      time.Duration(getEnvIntOrDefault("REQUEST_TIMEOUT_SECONDS", 30)) * time.Second,
+		MaxQueryLength:      getEnvIntOrDefault("MAX_QUERY_LENGTH", 2000),
+		TrustedOrigin:       getEnvOrDefault("TRUSTED_ORIGIN", "frontcompiladores.duckdns.org"),
+	}
+	
+	log.Printf("🛡️  Protección backend activada")
+	log.Printf("⚡ Rate limit: %d requests/min", config.MaxRequestsPerMin)
+	log.Printf("🔗 Conexiones concurrentes max: %d", config.MaxConcurrentConns)
+	log.Printf("🌐 Origen confiable: %s", config.TrustedOrigin)
+	
 	// Inicializar la base de datos
 	err := InitDB()
 	if err != nil {
 		log.Fatal("Error al inicializar la base de datos:", err)
 	}
 	defer CloseDB()
-
-	// Configurar Gin en modo release
+	
+	// Configurar Gin
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.Default()
-
-	// Middleware de seguridad MUY permisivo
+	
+	// Middleware de seguridad global
+	r.Use(TimeoutMiddleware(config.RequestTimeout))
 	r.Use(InputValidationMiddleware())
-	r.Use(SimpleRateLimitMiddleware(300)) // 300 requests por minuto (muy permisivo)
-	r.Use(BasicBotProtectionMiddleware()) // Solo bots obvios
-
-	// CORS MUY permisivo
+	r.Use(RateLimitMiddleware(config.MaxRequestsPerMin))
+	r.Use(ConcurrentConnectionsMiddleware(config.MaxConcurrentConns))
+	r.Use(TrustedOriginMiddleware(config.TrustedOrigin))
+	
+	if config.EnableIPWhitelist {
+		r.Use(IPWhitelistMiddleware(config.AllowedIPs))
+		log.Printf("🚫 IP Whitelist habilitado: %v", config.AllowedIPs)
+	}
+	
+	// Configurar CORS para tu frontend
 	corsConfig := cors.DefaultConfig()
-	corsConfig.AllowOrigins = []string{"https://frontcompiladores.duckdns.org", "*"} // Temporalmente muy permisivo
+	corsConfig.AllowOrigins = []string{"https://frontcompiladores.duckdns.org"}
 	corsConfig.AllowMethods = []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"}
-	corsConfig.AllowHeaders = []string{"*"} // Permitir todos los headers
-	corsConfig.ExposeHeaders = []string{"*"}
+	corsConfig.AllowHeaders = []string{"Origin", "Content-Type", "Accept", "Authorization"}
+	corsConfig.ExposeHeaders = []string{"Content-Length"}
 	corsConfig.AllowCredentials = false
 	corsConfig.MaxAge = 12 * time.Hour
 	r.Use(cors.New(corsConfig))
-
-	// Rutas de la API
+	
+	// Rutas de la API con handlers seguros
 	api := r.Group("/api")
 	{
-		// Análisis léxico/sintáctico sin restricciones
+		// Handlers originales para análisis (sin modificaciones SQL)
 		api.POST("/lexical-analysis", LexicalAnalysisHandler)
 		api.POST("/syntactic-analysis", SyntacticAnalysisHandler)
 		
-		// Operaciones de BD con validación mínima
+		// Handlers seguros para operaciones de BD
 		api.POST("/create-database", CreateDatabaseHandlerSecure)
 		api.POST("/use-database", UseDatabaseHandlerSecure)
 		api.POST("/create-table", CreateTableHandlerSecure)
@@ -365,25 +519,24 @@ func main() {
 		api.POST("/delete-database", DeleteDatabaseHandlerSecure)
 		api.GET("/database-info", GetDatabaseInfoHandler)
 	}
+	
 
-	// Health check sin restricciones
 	r.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"status": "ok",
 			"time":   time.Now().Format(time.RFC3339),
-			"secure": "permissive",
+			"secure": true,
 		})
 	})
-
+	
 	// Puerto del servidor
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
 	}
-
-	log.Printf("🚀 Servidor PERMISIVO iniciado en puerto %s", port)
-	log.Printf("🛡️ Protección básica activada (anti-bots + rate limit: 300/min)")
-	log.Printf("🌐 CORS muy permisivo para debugging")
-	log.Printf("💡 Health check: /health")
+	
+	log.Printf("🚀 Servidor seguro iniciado en puerto %s", port)
+	log.Printf("🌐 CORS configurado para: https://frontcompiladores.duckdns.org")
+	log.Printf("💡 Health check disponible en: /health")
 	log.Fatal(http.ListenAndServe(":"+port, r))
 }
